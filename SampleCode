@@ -1,0 +1,570 @@
+# COUNTY POPULATION VS NON_NATIVE ANT CHANGES CODE
+
+#to manipulate data
+library(dplyr)
+# what I need to start with in a dataframe, Sample, id_label, Native.Alien, nNative.Alien, pNative, pAlien, pMissing, geometry, ClimData, tBin10.2
+library(tidyverse)
+library(urbnmapr)
+library(sf)
+library(raster)
+library(sp)
+
+#plotting and graphing libraries for later
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(ggpubr)
+
+# get WorldClim data from object folder # this data can be downloaded from https://www.worldclim.org/data/bioclim.html
+WorldClim.RDS=readRDS("~/Dropbox/R/RDS/WorldClim.RDS")
+# county population is downloaded from US. census bureau, https://www.census.gov/data.html
+county_pop = fl_counties_pop
+# get occurrence dataset
+FLantDataset=read.csv("~/Dropbox/FloridaAntsDataFinal/Data.S1.Fl_ant_occurrences.csv")
+FLantDataset$weights=rep(1,length(FLantDataset[,1]), x=1)
+
+# turn lat and long into st object to associate collections record geographies with the hexgrid (f.grid2000) #
+ants.species.sf <- st_as_sf(FLantDataset, coords=c("LocLongitude", "LocLatitude"), crs=4326)
+ants.species.sf <- st_transform(ants.species.sf, crs="WGS84")
+# go to hex grid code for hex bins or swap county_pop for polygon units using county level data
+county_pop=st_read("~/Dropbox/R/FL_lulcc/FL_Counties.shp")
+intersectionAntSpecies.2000 <- st_intersection(county_pop, ants.species.sf)
+intersectionAntSpecies.2000$id_label = st_centroid(intersectionAntSpecies.2000$geometry)
+#saveRDS(intersectionAntSpecies.2000, "~/Dropbox/R/FLants/FinalFL/AntSpecies2000MultipleCollection.RDS")
+
+# Calculate the proportions of each category (native/alien/missing) and assign to new proportion category
+Species2000=intersectionAntSpecies.2000 %>%
+  group_by(Sample,cnty_nm,Native.Alien, Decade.Bin, Region) %>%
+  count(Native.Alien) %>%
+  group_by(Sample)%>%
+  mutate(Proportion=n/sum(n))
+
+
+# Giving all columns value = 0 to start
+Species2000$NonNative=rep(0,length(Species2000$n))
+Species2000$Native=rep(0,length(Species2000$n))
+Species2000$Unknown=rep(0,length(Species2000$n))
+
+# Figuring out which row position each native/NonNative species is listed
+NonNativeSp2000=which(Species2000$Native.Alien=="alien")
+nativeSp2000=which(Species2000$Native.Alien=="native")
+
+# Giving all columns with non-0 their respective proportions
+Species2000$NonNative[NonNativeSp2000]=Species2000$Proportion[NonNativeSp2000]
+Species2000$Native[nativeSp2000]=Species2000$Proportion[nativeSp2000]
+
+### add a column of centers for each hex grid for labeling later
+Species2000$geom2 = st_centroid(Species2000$geometry)
+
+### this is to get average values by hexbin ###
+
+HexBinNonNative2000County = Species2000 %>%
+  group_by(cnty_nm) %>%
+  summarise(NonNative=mean(NonNative))
+HexBinNonNative2000CountyDecade = Species2000 %>%
+  group_by(cnty_nm,Decade.Bin) %>%
+  summarise(NonNative=mean(NonNative)) 
+HexBinNonNativeWeight = Species2000 %>%
+  group_by(cnty_nm,Decade.Bin) %>%
+  summarise(weight=sum(n))
+
+
+HexBinNative2000 = Species2000 %>%
+  group_by(cnty_nm) %>%
+  summarise(Native=mean(Native))
+HexBinNonNative2000 = Species2000 %>%
+  group_by(cnty_nm) %>%
+  summarise(NonNative=mean(NonNative))
+
+library(betareg)
+county=unique(HexBinNonNative2000$cnty_nm)
+df=HexBinNonNative2000[,1:2]
+st_geometry(df)=NULL
+df$NonNativeSlope=NA
+for (i in 1:66) {
+  test=HexBinNonNative2000CountyDecade
+  st_geometry(test)=NULL
+  x=i+6
+  r=x+6
+  test=test[x:r,]
+  t=betareg(NonNative~Decade.Bin, data=test)
+  summary(t)
+  t$coefficients$mean[[2]]
+  df$NonNativeSlope[i] = t$coefficients$mean[[2]]
+}
+FL_census_summary = read.csv("~/Dropbox/R/FL_lulcc/AntPopComparison.csv")
+df
+df$county_name=df$cnty_nm
+df=df[,c("county_name","NonNativeSlope")]
+
+
+AntPopComparison=read_csv("~/Dropbox/R/FL_lulcc/AntPopComparison_Oct_2022.csv")
+popBeta=betareg(NonNative~X2020, data=AntPopComparison)
+summary(popBeta)
+
+county=unique(HexBinNonNative2000$cnty_nm)
+df2=HexBinNonNative2000[,1:2]
+st_geometry(df2)=NULL
+df2$GrowthSlope=NA
+i=1
+for (i in 1:66) {
+  test=popGrowthByDecade
+  x=i+6
+  r=x+6
+  test=test[x:r,]
+  t=lm(Row.1~Label, data=test)
+  summary(t)
+  df2$GrowthSlope[i] = t$coefficients[[2]]
+}
+
+df2$county_name=df2$cnty_nm
+df2=df2[,c("county_name","GrowthSlope")]
+df$GrowthSlope=df2$GrowthSlope
+
+FL_census_summary=left_join(FL_census_summary,df,by="county_name")
+
+
+##################
+################## Calculate FD for all comms and save in DF for sampling via timebins as done with PD
+
+antsSpeciesBerlese <- antOccurrenceDataset # can be downloaded through dryad
+
+##################
+##################
+library(fundiv)
+library(reshape) # for cast function
+library(ggplot2)
+library(FD)
+library(cluster)
+library(vegan)
+library(genpathmox)
+traits.table1 = read.csv("~/Dropbox/R/FLants/FinalFL/traits.table.csv", row.names="tip.labels")
+site.sp.table1 = read.csv("~/Dropbox/R/FLants/FinalFL/site.sp.table.csv", row.names="Sample")
+traits.tableNorm
+site.sp.quad.table
+FD_dendroFLsimple = FD_dendro(S = traits.table, A = site.sp.quad.table, Cluster.method = "average", ord = "podani")
+FD_dendroFL = FD_dendro(S = traits.table, A = site.sp.quad.table, Cluster.method = "average", ord = "podani", stand.x=F, stand.FD=T)
+FD_dendroFLNorm = FD_dendro(S = traits.tableNorm, A = site.sp.quad.table, Cluster.method = "average", ord = "podani", stand.x=F, stand.FD=T)
+
+FD_dendroFLJoin=FD_dendroFL
+FD_dendroFL$Sample=FD_dendroFLJoin$comm
+
+FD.df.1 = read.csv("~/Dropbox/R/FLants/Summary.PD.FD.csv")
+FD_dendroFLcomm=cbind.data.frame(FD.df.1$Sample,FD.df.1$tBin10.2.x.x,FD.df.1$Region.x.x,FD.df.1$native.n,
+                                 FD.df.1$native.proportion,FD.df.1$alien.n,FD.df.1$alien.proportion,
+                                 FD.df.1$n,FD.df.1$PD)
+colnames(FD_dendroFLcomm)= c("comm","Decade.Bin","Region","native.n","native.proportion","alien.n","alien.proportion","n","PD")
+FD.df.1.merge = merge.default(FD_dendroFLcomm,FD_dendroFL,by="comm")
+
+FD.AntSpecies=FD.df.1.merge
+
+nruns=1000
+# will have to load each data set manually into code to get this value - minimum = 11
+min = min(length(unique(South1965$comm)), length(unique(South1975$comm)), length(unique(South1985$comm)), 
+          length(unique(South1995$comm)), length(unique(South2005$comm)),
+          length(unique(Central1965$comm)), length(unique(Central1975$comm)),length(unique(Central1985$comm)), 
+          length(unique(Central1995$comm)), length(unique(Central2005$comm)),length(unique(Central2015$comm)), 
+          length(unique(North1965$comm)), length(unique(North1975$comm)), length(unique(North1985$comm)), 
+          length(unique(North1995$comm)), length(unique(North2005$comm))) 
+#for South FD, min = 25
+min = 25
+RegionMatrixFD=matrix(nrow=1000, ncol=11)
+names=c("1965_FD", "1975_FD", "1985_FD", "1995_FD", "2005_FD","2015_FD",
+        "1965_SR", "1975_SR", "1985_SR", "1995_SR", "2005_SR","2015_SR",
+        "1965_PD", "1975_PD", "1985_PD", "1995_PD", "2005_PD","2015_PD",
+        "Region")
+colnames(RegionMatrixFD) = names
+for(i in 1:1000){
+  SouthJ=which(FD.AntSpecies$Region=="South")
+  South = FD.AntSpecies[SouthJ,]
+  South1965=South[which(South$Decade.Bin=="1965"),]
+  South1975=South[which(South$Decade.Bin=="1975"),]
+  South1985=South[which(South$Decade.Bin=="1985"),]
+  South1995=South[which(South$Decade.Bin=="1995"),]
+  South2005=South[which(South$Decade.Bin=="2005"),]
+  
+  comm1965.S=sample(South1965$comm, min, replace = T)
+  subsetcomm1965South=subset(South, South$comm %in% comm1965.S)
+  subset1965SouthFD=mean(subsetcomm1965South$FDpg)
+  subset1965SouthSR=mean(subsetcomm1965South$n)
+  comm1975.S=sample(South1975$comm, min, replace = T)
+  subsetcomm1975South=subset(South, South$comm %in% comm1975.S)
+  subset1975SouthFD=mean(subsetcomm1975South$FDpg)
+  subset1975SouthSR=mean(subsetcomm1975South$n)
+  comm1985.S=sample(South1985$comm, min, replace = T)
+  subsetcomm1985South=subset(South, South$comm %in% comm1985.S)
+  subset1985SouthFD=mean(subsetcomm1985South$FDpg)
+  subset1985SouthSR=mean(subsetcomm1985South$n)
+  comm1995.S=sample(South1995$comm, min, replace = T)
+  subsetcomm1995South=subset(South, South$comm %in% comm1995.S)
+  subset1995SouthFD=mean(subsetcomm1995South$FDpg)
+  subset1995SouthSR=mean(subsetcomm1995South$n)
+  comm2005.S=sample(South2005$comm, min, replace = T)
+  subsetcomm2005South=subset(South, South$comm %in% comm2005.S)
+  subset2005SouthFD=mean(subsetcomm2005South$FDpg)
+  subset2005SouthSR=mean(subsetcomm2005South$n)
+  SouthMeanFD=cbind(subset1965SouthFD,subset1975SouthFD, 
+                    subset1985SouthFD, subset1995SouthFD, subset2005SouthFD)
+  SouthMeanSR=cbind(subset1965SouthSR,subset1975SouthSR, 
+                    subset1985SouthSR, subset1995SouthSR, subset2005SouthSR)
+  
+  RegionMatrixFD[i,1:5] = SouthMeanFD
+  RegionMatrixFD[i,6:10] = SouthMeanSR
+  RegionMatrixFD[i,11]="South"
+  
+}
+
+Decade_Bin_South=c(rep("1965",1000),rep("1975",1000),
+                   rep("1985",1000),rep("1995",1000),rep("2005",1000))
+FD_South=c(RegionMatrixFD[,1], RegionMatrixFD[,2], RegionMatrixFD[,3], RegionMatrixFD[,4], 
+           RegionMatrixFD[,5])
+SR_South=c(RegionMatrixFD[,6], RegionMatrixFD[,7],RegionMatrixFD[,8], RegionMatrixFD[,9], RegionMatrixFD[,10]) 
+Region_Bin = RegionMatrixFD[,11]
+
+SouthSampling1000=cbind(Decade_Bin_South, FD_South, SR_South, Region_Bin)
+SouthSampling1000=as.data.frame(SouthSampling1000)
+
+write.csv(SouthSampling1000,"~/Dropbox/R/FLants/RegionMatrixFDSouthMin.csv")
+SouthFD=RegionMatrixFD
+Mean.FD.South=matrix(nrow = 6, ncol = 2)
+Mean.FD.South[1,1]=mean(as.numeric(RegionMatrixFD[,1]))
+Mean.FD.South[1,2]=1965
+Mean.FD.South[2,1]=mean(as.numeric(RegionMatrixFD[,2]))
+Mean.FD.South[2,2]=1975
+Mean.FD.South[3,1]=mean(as.numeric(RegionMatrixFD[,3]))
+Mean.FD.South[3,2]=1985
+Mean.FD.South[4,1]=mean(as.numeric(RegionMatrixFD[,4]))
+Mean.FD.South[4,2]=1995
+Mean.FD.South[5,1]=mean(as.numeric(RegionMatrixFD[,5]))
+Mean.FD.South[5,2]=2005
+Mean.FD.South[6,1]=mean(as.numeric(RegionMatrixFD[,6]))
+Mean.FD.South[6,2]=2015
+
+Mean.SR.South=matrix(nrow = 6, ncol = 2)
+Mean.SR.South[1,1]=mean(as.numeric(RegionMatrixFD[,7]))
+Mean.SR.South[1,2]=1965
+Mean.SR.South[2,1]=mean(as.numeric(RegionMatrixFD[,8]))
+Mean.SR.South[2,2]=1975
+Mean.SR.South[3,1]=mean(as.numeric(RegionMatrixFD[,9]))
+Mean.SR.South[3,2]=1985
+Mean.SR.South[4,1]=mean(as.numeric(RegionMatrixFD[,10]))
+Mean.SR.South[4,2]=1995
+Mean.SR.South[5,1]=mean(as.numeric(RegionMatrixFD[,11]))
+Mean.SR.South[5,2]=2005
+Mean.SR.South[6,1]=mean(as.numeric(RegionMatrixFD[,12]))
+Mean.SR.South[6,2]=2015
+
+Mean.FD.South=as.data.frame(Mean.FD.South)
+names=c("Functional.Diversity","Decade")
+names(Mean.FD.South)=names
+Mean.FD.South2=Mean.FD.South[1:6,1:2]
+
+Mean.SR.South=as.data.frame(Mean.SR.South)
+names=c("Species.Richness","Decade")
+names(Mean.SR.South)=names
+Mean.SR.South2=Mean.SR.South[1:6,1:2]
+
+SR.FD.table=merge.default(Mean.FD.South2,Mean.SR.South2, by = "Decade")
+
+# for Central min = 67
+# min = 67
+
+for(i in 1:1000){
+  CentralJ=which(FD.AntSpecies$Region=="Central")
+  Central = FD.AntSpecies[CentralJ,]
+  Central1965=Central[which(Central$Decade.Bin=="1965"),]
+  Central1975=Central[which(Central$Decade.Bin=="1975"),]
+  Central1985=Central[which(Central$Decade.Bin=="1985"),]
+  Central1995=Central[which(Central$Decade.Bin=="1995"),]
+  Central2005=Central[which(Central$Decade.Bin=="2005"),]
+  
+  
+  
+  comm1965.S=sample(Central1965$comm, min, replace = T)
+  subsetcomm1965Central=subset(Central, Central$comm %in% comm1965.S)
+  subset1965CentralFD=mean(subsetcomm1965Central$FDpg)
+  subset1965CentralSR=mean(subsetcomm1965Central$n)
+  comm1975.S=sample(Central1975$comm, min, replace = T)
+  subsetcomm1975Central=subset(Central, Central$comm %in% comm1975.S)
+  subset1975CentralFD=mean(subsetcomm1975Central$FDpg)
+  subset1975CentralSR=mean(subsetcomm1975Central$n)
+  comm1985.S=sample(Central1985$comm, min, replace = T)
+  subsetcomm1985Central=subset(Central, Central$comm %in% comm1985.S)
+  subset1985CentralFD=mean(subsetcomm1985Central$FDpg)
+  subset1985CentralSR=mean(subsetcomm1985Central$n)
+  comm1995.S=sample(Central1995$comm, min, replace = T)
+  subsetcomm1995Central=subset(Central, Central$comm %in% comm1995.S)
+  subset1995CentralFD=mean(subsetcomm1995Central$FDpg)
+  subset1995CentralSR=mean(subsetcomm1995Central$n)
+  comm2005.S=sample(Central2005$comm, min, replace = T)
+  subsetcomm2005Central=subset(Central, Central$comm %in% comm2005.S)
+  subset2005CentralFD=mean(subsetcomm2005Central$FDpg)
+  subset2005CentralSR=mean(subsetcomm2005Central$n)
+  CentralMeanFD=cbind(subset1965CentralFD,subset1975CentralFD, 
+                      subset1985CentralFD, subset1995CentralFD, subset2005CentralFD)
+  CentralMeanSR=cbind(subset1965CentralSR,subset1975CentralSR, 
+                      subset1985CentralSR, subset1995CentralSR, subset2005CentralSR)
+  
+  RegionMatrixFD[i,1:5] = CentralMeanFD
+  RegionMatrixFD[i,6:10] = CentralMeanSR
+  RegionMatrixFD[i,11]="Central"
+  
+}
+
+Decade_Bin_Central=c(rep("1965",1000),rep("1975",1000),
+                     rep("1985",1000),rep("1995",1000),rep("2005",1000))
+FD_Central=c(RegionMatrixFD[,1], RegionMatrixFD[,2], RegionMatrixFD[,3], RegionMatrixFD[,4], 
+             RegionMatrixFD[,5])
+SR_Central=c(RegionMatrixFD[,6], RegionMatrixFD[,7],RegionMatrixFD[,8], RegionMatrixFD[,9], RegionMatrixFD[,10]) 
+Region_Bin = RegionMatrixFD[,11]
+
+CentralSampling1000=cbind(Decade_Bin_Central, FD_Central, SR_Central, Region_Bin)
+CentralSampling1000=as.data.frame(CentralSampling1000)
+
+write.csv(CentralSampling1000,"~/Dropbox/R/FLants/RegionMatrixFDCentralMin.csv")
+CentralFD=RegionMatrixFD
+# for North min = 39
+# min = 39
+
+for(i in 1:1000){
+  NorthJ=which(FD.AntSpecies$Region=="North")
+  North = FD.AntSpecies[NorthJ,]
+  North1965=North[which(North$Decade.Bin=="1965"),]
+  North1975=North[which(North$Decade.Bin=="1975"),]
+  North1985=North[which(North$Decade.Bin=="1985"),]
+  North1995=North[which(North$Decade.Bin=="1995"),]
+  North2005=North[which(North$Decade.Bin=="2005"),]
+  
+  
+  
+  comm1965.S=sample(North1965$comm, min, replace = T)
+  subsetcomm1965North=subset(North, North$comm %in% comm1965.S)
+  subset1965NorthFD=mean(subsetcomm1965North$FDpg)
+  subset1965NorthSR=mean(subsetcomm1965North$n)
+  comm1975.S=sample(North1975$comm, min, replace = T)
+  subsetcomm1975North=subset(North, North$comm %in% comm1975.S)
+  subset1975NorthFD=mean(subsetcomm1975North$FDpg)
+  subset1975NorthSR=mean(subsetcomm1975North$n)
+  comm1985.S=sample(North1985$comm, min, replace = T)
+  subsetcomm1985North=subset(North, North$comm %in% comm1985.S)
+  subset1985NorthFD=mean(subsetcomm1985North$FDpg)
+  subset1985NorthSR=mean(subsetcomm1985North$n)
+  comm1995.S=sample(North1995$comm, min, replace = T)
+  subsetcomm1995North=subset(North, North$comm %in% comm1995.S)
+  subset1995NorthFD=mean(subsetcomm1995North$FDpg)
+  subset1995NorthSR=mean(subsetcomm1995North$n)
+  comm2005.S=sample(North2005$comm, min, replace = T)
+  subsetcomm2005North=subset(North, North$comm %in% comm2005.S)
+  subset2005NorthFD=mean(subsetcomm2005North$FDpg)
+  subset2005NorthSR=mean(subsetcomm2005North$n)
+  NorthMeanFD=cbind(subset1965NorthFD,subset1975NorthFD, 
+                    subset1985NorthFD, subset1995NorthFD, subset2005NorthFD)
+  NorthMeanSR=cbind(subset1965NorthSR,subset1975NorthSR, 
+                    subset1985NorthSR, subset1995NorthSR, subset2005NorthSR)
+  
+  RegionMatrixFD[i,1:5] = NorthMeanFD
+  RegionMatrixFD[i,6:10] = NorthMeanSR
+  RegionMatrixFD[i,11]="North"
+  
+}
+
+Decade_Bin_North=c(rep("1965",1000),rep("1975",1000),
+                   rep("1985",1000),rep("1995",1000),rep("2005",1000))
+FD_North=c(RegionMatrixFD[,1], RegionMatrixFD[,2], RegionMatrixFD[,3], RegionMatrixFD[,4], 
+           RegionMatrixFD[,5])
+SR_North=c(RegionMatrixFD[,6], RegionMatrixFD[,7],RegionMatrixFD[,8], RegionMatrixFD[,9], RegionMatrixFD[,10]) 
+Region_Bin = RegionMatrixFD[,11]
+
+NorthSampling1000=cbind(Decade_Bin_North, FD_North, SR_North, Region_Bin)
+NorthSampling1000=as.data.frame(NorthSampling1000)
+
+write.csv(NorthSampling1000,"~/Dropbox/R/FLants/RegionMatrixFDNorthMin.csv")
+NorthFD=RegionMatrixFD
+
+NorthSampling1000
+N.1965North1965=which(NorthSampling1000$Decade_Bin_North=="1965")
+n1965=NorthSampling1000[N.1965North1965,]
+mean(n1965$SR_North)
+is.numeric(n1965$FD_North)
+is.na(n1965$FD_North)
+which(NorthSampling1000$Decade_Bin_North=="1965")
+
+N.1965.FD=as.data.frame.integer(NorthSampling1000$FD[which(NorthSampling1000$Decade_Bin_North=="1965")], ncol = 1)
+
+
+################# Phylogenetid Diversity sample code
+
+library(betapart)
+library(dplyr)
+library(forcats) # explicit_NA
+library(reshape) # for cast function
+library(picante) # vegdist
+library(ape)
+library(phytools)
+remotes::install_github("KlausVigo/phangorn")
+
+# Datasets
+# Phylogeny
+FLTree <- read.tree("~/Dropbox/R/FLants/RAxML_bestTree.result_treepl_CV_195tips_STRUMIGENYSADDED_INGROUP.tre")
+FLTree <- read.tree("~/Dropbox/R/FLants/FinalFL/RAxML_bestTree.result_treepl_CV_195tips_STRUMIGENYSADDED.tre")
+FLTree$tip.label[which(FLTree$tip.label=="Strumigenys_pilinasis")]="Strumigenys_brevisetosa"
+FLTree$tip.label[which(FLTree$tip.label=="Pheidole_moerens")]="Pheidole_navigans"
+
+
+FLTree = force.ultrametric(FLTree)
+is.ultrametric(FLTree)
+PhyloFormatAntCollections=read.csv("~/Dropbox/R/FLants/FinalFL/SingleSpeciesV9RformatPhyloFormat.csv")
+FLtree.tip.label=unique(FLTree$tip.label)
+write.csv(FLtree.tip.label,"~/Dropbox/R/FLants/FinalFL/FLtree.tip.label.csv")
+# we can make a time bin = site and pull species at random within that time bin
+
+prunedTree <- prune.sample(site.sp.PD,FLTree)
+PD.All.samples=pd(site.sp.PD, prunedTree, include.root=F)
+i=1
+SampleSize=5
+
+# the following code was run for each region, "South" region here is for sample code
+for(i in 1:1000){
+  SouthJ=which(PhyloFormatAntCollections$Region=="South")
+  South=PhyloFormatAntCollections[SouthJ,]
+  South1965=South[which(South$decade.bin=="1965"),]
+  South1975=South[which(South$decade.bin=="1975"),]
+  South1985=South[which(South$decade.bin=="1985"),]
+  South1995=South[which(South$decade.bin=="1995"),]
+  South2005=South[which(South$decade.bin=="2005"),]
+  South2015=South[which(South$decade.bin=="2015"),]
+  
+  
+  sample1965.South=data.frame(sample(South1965$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample1965.South)="tip.labels"
+  decade1965=data.frame(rep(1965,5))
+  colnames(decade1965)="South.1965"
+  SampleSouth1965=data.frame(cbind(sample1965.South,decade1965))
+  cast(SampleSouth1965, "South.1965" ~ "tip.labels", value = "South.1965", fun.aggregate = length)
+  sample1975.South=data.frame(sample(South1975$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample1975.South)="South.1975"
+  sample1985.South=data.frame(sample(South1985$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample1985.South)="South.1985"
+  sample1995.South=data.frame(sample(South1995$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample1995.South)="South.1995"
+  sample2005.South=data.frame(sample(South2005$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample2005.South)="South.2005"
+  sample2015.South=data.frame(sample(South2015$tip.labels,SampleSize, replace = FALSE))
+  colnames(sample2015.South)="South.2015"
+  SouthSubsetAll=cbind(sample1965.South,sample1975.South,sample1985.South, sample1995.South, sample2005.South, sample2015.South)
+  
+  PD.site.sp.South <- cast(SouthSubsetAll, decade.bin ~ tip.labels, value = "Region", fun.aggregate = length)
+  
+  
+  PD.site.sp.South <- as.data.frame(PD.site.sp.South)
+  PDSouth=pd(PD.site.sp.South, prunedTree, include.root=F)
+
+}
+
+
+# Saving raw data from sampled run
+SouthRep=c(rep("1965",1000),rep("1975",1000),
+           rep("1985",1000),rep("1995",1000),rep("2005",1000),rep("2015",1000))
+SouthVal=c(RegionMatrix[,1], RegionMatrix[,2], RegionMatrix[,3], RegionMatrix[,4], 
+           RegionMatrix[,5], RegionMatrix[,6])
+SouthSampling1000=cbind(SouthRep, SouthVal)
+write.csv(SouthSampling1000,"~/Dropbox/R/FLants/FinalFL/RegionMatrixSouthMin.csv")
+
+# betareg used to run regressions on these sampled data
+
+
+
+################################# ################################ ################################ 
+################### Map data to create a hex grid of 2000km areas over FL #########################
+################################ ################################ #################################
+
+#### Hexbinning FL, pulling Bioclim data
+
+#BioClim Data Gathering
+# what I need to start with in a dataframe, Sample, id_label, Native.Alien, nNative.Alien, pNative, pAlien, pMissing, geometry, ClimData, tBin10.2
+library(tidyverse)
+library(urbnmapr)
+library(sf)
+library(raster)
+library(sp)
+
+#plotting and graphing libraries for later
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(ggpubr)
+
+
+states_sf <- get_urbn_map("states", sf = TRUE)
+# Limiting map data to Florida
+fl <- states_sf %>% 
+  filter(state_name == "Florida") 
+st_crs(fl)
+# this makes hexbins 2000km2 each
+f.grid2000 <- st_make_grid(fl, cellsize=48056.2, square = FALSE) %>%
+  st_intersection(fl) %>%
+  st_sf()
+f.grid2000$id_label <- 1:length(f.grid2000$geometry)
+
+# get intersection of Species records with 2000km areas
+### add a column of centers for each hex grid for labeling later
+f.grid2000$geom1 = st_centroid(st_geometry(f.grid2000))
+f.grid.centroid.df = data.frame(st_coordinates(f.grid2000$geom1))
+f.grid2000$X=f.grid.centroid.df$X
+f.grid2000$Y=f.grid.centroid.df$Y
+# Addding a label for each grid
+f.grid2000$id_label <- 1:length(f.grid2000$geometry)
+### add a column of centers for each hex grid for labeling later
+f.grid2000$geom1 = st_centroid(st_geometry(f.grid2000))
+################################ ################################ ################################ 
+################################ CLIMATE DATA #####################################
+################################ ################################ ################################ 
+# Pulling in climate data from the raster package
+# Right now just for Temperature and Precipitation
+# but could pull more.
+# Note "r" below is a RasterStack object
+####### data names
+#BIO1 = Annual Mean Temperature
+#BIO2 = Mean Diurnal Range (Mean of monthly (max temp – min temp))
+#BIO3 = Isothermality (BIO2/BIO7) (* 100)
+#BIO4 = Temperature Seasonality (standard deviation *100)
+#BIO5 = Max Temperature of Warmest Month
+#BIO6 = Min Temperature of Coldest Month
+#BIO7 = Temperature Annual Range (BIO5-BIO6)
+#BIO8 = Mean Temperature of Wettest Quarter
+#BIO9 = Mean Temperature of Driest Quarter
+#BIO10 = Mean Temperature of Warmest Quarter
+#BIO11 = Mean Temperature of Coldest Quarter
+#BIO12 = Annual Precipitation
+#BIO13 = Precipitation of Wettest Month
+#BIO14 = Precipitation of Driest Month
+#BIO15 = Precipitation Seasonality (Coefficient of Variation)
+#BIO16 = Precipitation of Wettest Quarter
+#BIO17 = Precipitation of Driest Quarter
+#BIO18 = Precipitation of Warmest Quarter
+#BIO19 = Precipitation of Coldest Quarter
+r <- getData("worldclim",var="bio",res=2.5)
+#using only Min Temperature of Coldest Month #BIO06 and annual precipitation #BIO12
+r <- r[[c(6,12)]]
+names(r) <- c("Temp","Prec")
+# Pulling out the climate data that is relevant on the florida map
+clim.data2000 <- raster::extract(r, f.grid2000)
+# How. many different types of climate data did we pull?
+clim.columns2000 <- ncol(as.data.frame(clim.data2000[1]))
+# How many measurements are in each of the grids
+v1.2000 <- as.numeric(lapply(clim.data2000, length))/clim.columns2000
+# Converting the climate list to a more useful data frame
+# But note, what's (temporarily) lost is keeping track
+# of which climate data are associated with which grid
+# We will put that info back in a minute
+dd.clim.data2000 <- data.frame(Reduce(rbind, clim.data2000))
+# Add an identifier column. to the climate df
+dd.clim.data2000$grid <- c(rep(1:length(clim.data2000), v1.2000[1:length(clim.data2000)]))
+dd.clim.data2000$grid <- as.factor(dd.clim.data2000$grid)
+# Calculating the mean climate data for each grid
+summary.clim2000 <- dd.clim.data2000 %>%
+  group_by(grid) %>%
+  summarize(Temp=mean(Temp, na.rm=T), Prec=mean(Prec, na.rm=T))
+# Adding the temperature data to the map
+f.grid2000$Temp <- summary.clim2000$Temp/10 #degC
+f.grid2000$Precip <- summary.clim2000$Prec/10 #cm
